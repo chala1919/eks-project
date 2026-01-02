@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: ingress-nginx-resource-quota
+  namespace: ingress-nginx
+spec:
+  hard:
+    requests.cpu: "500m"
+    requests.memory: 1Gi
+    limits.cpu: "1"
+    limits.memory: 2Gi
