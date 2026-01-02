@@ -128,11 +128,34 @@ You can use Grafana and Alertmanager to configure alerts about Dagster daemons, 
    ```
 
 4. **Deploy**:
+
+   **Option A: Using the deployment script (recommended)**
+   
+   The project includes deployment scripts that automate the deployment process in the correct order:
+   
+   **For Linux/Mac:**
+   ```bash
+   ./deploy.sh
+   ```
+   
+   **For Windows (PowerShell):**
+   ```powershell
+   .\deploy.ps1
+   ```
+   
+   The script will:
+   - Initialize Terraform
+   - Deploy resources in the correct order (VPC → EKS → Addons → Ingress → Remaining resources)
+   - Wait for ingress resources to be ready
+   - Display access URLs and credentials for Dagster, ArgoCD, and Grafana
+   
+   **Option B: Manual deployment**
    ```bash
    terraform init
    terraform plan
    terraform apply
    ```
+   
    Takes about 15-20 minutes.
 
 5. **Configure kubectl**:
