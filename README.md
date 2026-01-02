@@ -59,6 +59,191 @@ You can use Grafana and Alertmanager to configure alerts about Dagster daemons, 
 
 ---
 
+## Network Design
+
+### VPC Architecture
+
+The infrastructure is deployed in a single VPC with a multi-AZ design for high availability:
+
+**VPC Configuration:**
+- **CIDR Block**: `10.0.0.0/16` (default, configurable via `vpc_cidr` variable)
+- **Availability Zones**: 2 AZs (automatically selected from available AZs in the region)
+- **DNS Support**: Enabled (`enable_dns_support = true`)
+- **DNS Hostnames**: Enabled (`enable_dns_hostnames = true`)
+
+### Subnet Layout
+
+The VPC is divided into public and private subnets, distributed across 2 availability zones:
+
+```
+VPC: 10.0.0.0/16
+│
+├── Availability Zone 1
+│   ├── Public Subnet:  10.0.1.0/24
+│   │   └── Internet Gateway (IGW)
+│   │   └── Bastion Host
+│   │   └── ALB (Internet-facing)
+│   │
+│   └── Private Subnet: 10.0.11.0/24
+│       └── EKS Control Plane Endpoint (private)
+│       └── EKS Node Group
+│       └── Karpenter Nodes
+│       └── Application Pods (Dagster, ArgoCD, etc.)
+│
+└── Availability Zone 2
+    ├── Public Subnet:  10.0.2.0/24
+    │   └── Internet Gateway (IGW)
+    │   └── ALB (Internet-facing)
+    │
+    └── Private Subnet: 10.0.12.0/24
+        └── EKS Control Plane Endpoint (private)
+        └── EKS Node Group
+        └── Karpenter Nodes
+        └── Application Pods (Dagster, ArgoCD, etc.)
+```
+
+**Subnet Configuration:**
+
+| Subnet Type | CIDR Blocks | AZs | Purpose |
+|------------|-------------|-----|---------|
+| Public | `10.0.1.0/24`, `10.0.2.0/24` | 2 | Internet-facing resources (ALB, Bastion) |
+| Private | `10.0.11.0/24`, `10.0.12.0/24` | 2 | EKS nodes, application pods, internal services |
+
+**Default CIDR Blocks** (configurable via variables):
+- Public subnets: `["10.0.1.0/24", "10.0.2.0/24"]`
+- Private subnets: `["10.0.11.0/24", "10.0.12.0/24"]`
+
+### Network Routing
+
+**Public Subnets:**
+- Route to Internet Gateway (IGW) for direct internet access
+- Used for:
+  - Bastion host (SSM/SSH access)
+  - Internet-facing Application Load Balancer (ALB)
+  - NAT Gateway (in AZ 1)
+
+**Private Subnets:**
+- Route to NAT Gateway (in public subnet) for outbound internet access
+- **No direct internet ingress** - all inbound traffic goes through ALB in public subnets
+- Used for:
+  - EKS cluster control plane endpoint (private access enabled)
+  - EKS managed node groups
+  - Karpenter-provisioned nodes
+  - All application pods (Dagster, ArgoCD, monitoring, etc.)
+
+**NAT Gateway Configuration:**
+- **Single NAT Gateway** (cost optimization)
+- Located in the first public subnet (AZ 1)
+- Provides outbound internet access for all private subnets
+- **Note**: For production with higher availability requirements, consider using multiple NAT gateways (one per AZ)
+
+### EKS Networking
+
+**EKS Cluster Placement:**
+- EKS control plane is **AWS-managed** (not in your VPC)
+- EKS nodes are deployed in **private subnets only**
+- Control plane endpoint configuration:
+  - Public access: `enabled` (for kubectl access from anywhere)
+  - Private access: `enabled` (for secure internal access)
+
+**Pod Networking:**
+- Uses **AWS VPC CNI** (Container Network Interface) plugin
+- Pods receive IP addresses directly from the VPC subnet CIDR
+- Each pod gets a real VPC IP address (no overlay network)
+- Pods can communicate with other AWS services without NAT
+
+**Subnet Tags for EKS:**
+- Public subnets tagged with:
+  - `kubernetes.io/role/elb = "1"` - Allows ALB creation
+  - `kubernetes.io/cluster/<cluster-name> = "shared"` - Cluster association
+- Private subnets tagged with:
+  - `kubernetes.io/role/internal-elb = "1"` - Allows internal ALB creation
+  - `kubernetes.io/cluster/<cluster-name> = "shared"` - Cluster association
+  - `karpenter.sh/discovery = <cluster-name>` - Karpenter node discovery
+
+### Network Flow
+
+**Inbound Traffic Flow:**
+```
+Internet
+  ↓
+Internet Gateway (IGW)
+  ↓
+Public Subnet (ALB)
+  ↓
+Private Subnet (EKS Nodes/Pods)
+  ↓
+Application Pods
+```
+
+**Outbound Traffic Flow (from Private Subnets):**
+```
+Private Subnet (EKS Nodes/Pods)
+  ↓
+NAT Gateway (in Public Subnet)
+  ↓
+Internet Gateway (IGW)
+  ↓
+Internet
+```
+
+**Bastion Access:**
+```
+Your Local Machine
+  ↓
+AWS Systems Manager (SSM)
+  ↓
+Public Subnet (Bastion Host)
+  ↓
+S3 Bucket (via IAM role)
+```
+
+### Security Groups
+
+**EKS Node Security Group:**
+- Managed by EKS module
+- Allows communication between nodes and pods
+- Tagged with `karpenter.sh/discovery` for Karpenter integration
+
+**ALB Security Group:**
+- Allows inbound HTTP (80) and HTTPS (443) from internet
+- Allows outbound to EKS node security group
+
+**Bastion Security Group:**
+- Allows inbound SSH (22) from specified CIDR blocks (configurable)
+- Allows outbound to S3 (via IAM role, not security group)
+
+### Network Security Features
+
+1. **Private Subnet Isolation**: EKS nodes and pods are in private subnets with no direct internet access
+2. **NAT Gateway**: Provides controlled outbound internet access for private resources
+3. **Security Groups**: Layer 3/4 firewall rules controlling traffic between resources
+4. **VPC CNI**: Pods use VPC IPs, enabling native AWS security features
+5. **Private EKS Endpoint**: Optional private-only access to EKS control plane
+
+### IP Address Allocation
+
+**VPC CIDR**: `10.0.0.0/16` (65,536 IPs)
+
+**Allocated Subnets**:
+- Public Subnet 1: `10.0.1.0/24` (256 IPs)
+- Public Subnet 2: `10.0.2.0/24` (256 IPs)
+- Private Subnet 1: `10.0.11.0/24` (256 IPs)
+- Private Subnet 2: `10.0.12.0/24` (256 IPs)
+
+**Reserved IPs per Subnet**:
+- AWS reserves 5 IPs per subnet (first 4 + last 1)
+- Available IPs per subnet: ~251 IPs
+- EKS nodes typically use 1-2 IPs per node
+- Pods use 1 IP per pod (VPC CNI mode)
+
+**Production Considerations**:
+- For larger clusters, consider using larger CIDR blocks (e.g., `/20` or `/18`)
+- Monitor IP address usage to avoid exhaustion
+- Plan for growth: each node can host many pods depending on instance type
+
+---
+
 ## How to Provision
 
 ### Prerequisites
